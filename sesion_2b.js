@@ -11,9 +11,12 @@
 var aoi = ee.Geometry.Polygon([[
   [-2.82, 40.30], [-2.55, 40.30], [-2.55, 40.49], [-2.82, 40.49], [-2.82, 40.30]
 ]]);
-var INICIO = '2019-01-01';
-var FIN    = '2025-12-31';
-var ESCALA = 20;            // m (B11 es de 20 m)
+// Dos años (sequía 2022–2023) para que la serie se calcule en clase sin agotar
+// memoria; para periodos largos, exportad la tabla (bloque 8).
+var INICIO = '2022-01-01';
+var FIN    = '2023-12-31';
+var ESCALA = 20;            // m (B11 es de 20 m) para los mapas
+var ESCALA_SERIE = 30;      // m para la serie: 2,25 veces menos píxeles por fecha
 var UMBRAL_MNDWI = 0;       // punto de partida; ajustar con Otsu (demo 2.3)
 
 Map.centerObject(aoi, 11);
@@ -21,11 +24,13 @@ Map.addLayer(ee.Image().paint(aoi, 0, 2), {palette: ['yellow']}, '0. AOI');
 
 // ===== 1. ZONA DEL EMBALSE A PARTIR DE JRC GLOBAL SURFACE WATER ==============
 // max_extent = píxeles que han tenido agua alguna vez (1984–2021).
-// Se amplía 100 m para no perder orillas y se usa para no contar charcas ajenas.
+// Se usa como zona de análisis para no contar charcas ni balsas ajenas.
+// (No se amplía con focalMax: una operación focal se recalcularía en cada
+// una de las ~150 fechas de la serie y agotaría la memoria.)
 var extMax = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').select('max_extent').clip(aoi);
-var zona = extMax.focalMax(100, 'circle', 'meters').selfMask().rename('zona');
+var zona = extMax.selfMask().rename('zona');
 Map.addLayer(extMax.selfMask(), {palette: ['0000ff']}, '1a. Extensión máxima histórica (JRC)');
-Map.addLayer(zona, {palette: ['00ffff'], opacity: 0.4}, '1b. Zona de análisis (+100 m)', false);
+Map.addLayer(zona, {palette: ['00ffff'], opacity: 0.4}, '1b. Zona de análisis', false);
 
 print('1. Superficie máxima histórica en el AOI (ha) — debe rondar 8 000–9 000:',
   extMax.selfMask().multiply(ee.Image.pixelArea()).divide(1e4).reduceRegion({
@@ -36,34 +41,61 @@ print('1. Superficie máxima histórica en el AOI (ha) — debe rondar 8 000–9
 var S2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
 var CS = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
 
-function mascaraS2(img) {
-  return img.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12']).divide(10000)
-    .updateMask(img.select('cs_cdf').gte(0.60))
-    .set('system:time_start', img.get('system:time_start'));
-}
+var BANDAS = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'];
 
-var col = S2.filterBounds(aoi).filterDate(INICIO, FIN)
-  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))   // descarta escenas casi cubiertas
-  .linkCollection(CS, ['cs_cdf'])
-  .map(mascaraS2);
-print('2. Nº de escenas:', col.size());
+// Colecciones SIN procesar: filtrarlas y leer sus fechas solo usa metadatos,
+// así que es casi instantáneo.
+var s2col = S2.filterBounds(aoi).filterDate(INICIO, FIN)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70));   // descarta escenas casi cubiertas
+var cscol = CS.filterBounds(aoi).filterDate(INICIO, FIN);
+print('2. Nº de escenas Sentinel-2:', s2col.size());
 
 // Si el embalse cae entre dos teselas, cada escena lo cubre a medias:
-// se une todo lo adquirido el mismo día en un mosaico.
-var dias = col.aggregate_array('system:time_start')
-  .map(function (t) { return ee.Date(t).format('YYYY-MM-dd'); })
-  .distinct();
-var porDia = ee.ImageCollection.fromImages(dias.map(function (d) {
-  var f = ee.Date.parse('YYYY-MM-dd', d);
-  return col.filterDate(f, f.advance(1, 'day')).mosaic().clip(aoi)
+// se une todo lo adquirido el mismo día en un mosaico, y DESPUÉS se enmascara.
+// (Construir los mosaicos a partir de una colección ya enmascarada con
+// linkCollection obliga a repetir el emparejamiento para cada día y agota
+// la memoria de GEE.)
+function imagenDia(fecha) {                  // fecha: texto 'YYYY-MM-dd'
+  var f = ee.Date.parse('YYYY-MM-dd', fecha);
+  var s2 = s2col.filterDate(f, f.advance(1, 'day')).mosaic();
+  var cs = cscol.filterDate(f, f.advance(1, 'day')).mosaic();
+  return s2.select(BANDAS).divide(10000)
+    .updateMask(cs.select('cs_cdf').gte(0.60))   // fuera nubes y sombras
+    .clip(aoi)
     .set('system:time_start', f.millis())
-    .set('fecha', d);
-}));
-print('2. Nº de fechas (mosaicos diarios):', porDia.size());
+    .set('fecha', fecha);
+}
+
+// Lista de días con imagen (solo metadatos)
+function fechas(coleccion) {
+  return coleccion.aggregate_array('system:time_start')
+    .map(function (t) { return ee.Date(t).format('YYYY-MM-dd'); })
+    .distinct();
+}
+var diasS2 = fechas(s2col);
+var diasCS = fechas(cscol);
+// Algunos días tienen escena Sentinel-2 pero no máscara Cloud Score+:
+// sin ella el mosaico de nubes no tendría bandas, así que se descartan.
+var dias = diasS2.filter(ee.Filter.inList('item', diasCS));
+print('2. Días con Sentinel-2:', diasS2.length());
+print('2. Días con Sentinel-2 y Cloud Score+ (mosaicos diarios):', dias.length());
+
+var porDia = ee.ImageCollection.fromImages(dias.map(imagenDia));
 
 // ===== 3. UNA FECHA DE EJEMPLO: IMAGEN, MNDWI Y AGUA ==========================
-var ejemplo = ee.Image(porDia.filterDate('2023-08-01', '2023-09-01').first());
-print('3. Fecha del ejemplo:', ejemplo.get('fecha'));
+// Las capas del mapa se construyen siempre con imagenDia() (no desde la serie):
+// el mapa se calcula por teselas y cada tesela no debe recalcular la serie entera.
+// Fecha con menos nubes de agosto de 2023 (se puede sustituir por un texto
+// 'YYYY-MM-dd' de cualquier día con imagen)
+// (de entre los días que también tienen Cloud Score+)
+var FECHA_EJEMPLO = s2col.filterDate('2023-08-01', '2023-09-01')
+  .sort('CLOUDY_PIXEL_PERCENTAGE')
+  .aggregate_array('system:time_start')
+  .map(function (t) { return ee.Date(t).format('YYYY-MM-dd'); })
+  .filter(ee.Filter.inList('item', dias))
+  .get(0);
+print('3. Fecha del ejemplo:', FECHA_EJEMPLO);
+var ejemplo = imagenDia(FECHA_EJEMPLO);
 Map.addLayer(ejemplo, {bands: ['B8', 'B11', 'B4'], min: 0, max: 0.4}, '3a. Imagen ejemplo (agua en negro)');
 var mndwiEj = ejemplo.normalizedDifference(['B3', 'B11']).rename('MNDWI');
 Map.addLayer(mndwiEj, {min: -0.6, max: 0.6, palette: ['ffffff', '00ffff', '0000ff']}, '3b. MNDWI ejemplo');
@@ -73,7 +105,7 @@ Map.addLayer(mndwiEj.gt(UMBRAL_MNDWI).updateMask(zona).selfMask(),
 // ===== 4. SUPERFICIE DE AGUA Y FRACCIÓN VÁLIDA POR FECHA ======================
 // Superficie total de la zona de análisis (se calcula una sola vez)
 var zonaHa = ee.Number(zona.gt(0).multiply(ee.Image.pixelArea()).divide(1e4).reduceRegion({
-  reducer: ee.Reducer.sum(), geometry: aoi, scale: ESCALA, maxPixels: 1e10
+  reducer: ee.Reducer.sum(), geometry: aoi, scale: ESCALA_SERIE, maxPixels: 1e10
 }).get('zona'));
 
 function superficieAgua(img) {
@@ -84,8 +116,11 @@ function superficieAgua(img) {
   // Banda 2: hectáreas con dato válido (sin nube y dentro de la escena)
   var valido = img.select('B3').mask().gt(0).multiply(ha).rename('valido');
   // Una sola reducción por fecha para las dos bandas (más rápido)
+  // tileScale: 4 divide el cálculo en teselas más pequeñas: evita el error
+  // "memory capacity exceeded" a cambio de tardar algo más.
   var suma = agua.addBands(valido).updateMask(zona).reduceRegion({
-    reducer: ee.Reducer.sum(), geometry: aoi, scale: ESCALA, maxPixels: 1e10
+    reducer: ee.Reducer.sum(), geometry: aoi, scale: ESCALA_SERIE,
+    maxPixels: 1e10, tileScale: 4
   });
   return ee.Feature(null, {
     'system:time_start': img.get('system:time_start'),
@@ -117,23 +152,40 @@ print(ui.Chart.feature.byFeature({
 }));
 
 // ===== 6. MAPAS DE LAS FECHAS DE MÁXIMO Y MÍNIMO ==============================
-function mapaFecha(feature, nombre, color) {
-  feature = ee.Feature(feature);
-  var img = ee.Image(porDia.filter(ee.Filter.eq('fecha', feature.get('fecha'))).first());
+// Las fechas extremas se piden UNA sola vez al servidor con evaluate().
+// Con la fecha ya en el navegador, los mapas se construyen con imagenDia():
+// si se construyeran desde serieAgua, cada tesela del mapa recalcularía
+// la serie entera y GEE agotaría la memoria.
+function mapaFecha(fecha, nombre, color) {
+  var img = imagenDia(fecha);
+  Map.addLayer(img, {bands: ['B8', 'B11', 'B4'], min: 0, max: 0.4}, nombre + ' · imagen', false);
   Map.addLayer(img.normalizedDifference(['B3', 'B11']).gt(UMBRAL_MNDWI)
     .updateMask(zona).selfMask(), {palette: [color]}, nombre);
-  print(nombre, feature.get('fecha'), feature.get('ha_agua'));
 }
-mapaFecha(serieAgua.sort('ha_agua', false).first(), '6a. Agua en la fecha de MÁXIMO', '08306b');
-mapaFecha(serieAgua.sort('ha_agua').first(),        '6b. Agua en la fecha de MÍNIMO', 'ff0000');
+
+var maximo = ee.Feature(serieAgua.sort('ha_agua', false).first());
+var minimo = ee.Feature(serieAgua.sort('ha_agua').first());
+ee.Dictionary({
+  fechaMax: maximo.get('fecha'), haMax: maximo.get('ha_agua'),
+  fechaMin: minimo.get('fecha'), haMin: minimo.get('ha_agua')
+}).evaluate(function (e, error) {
+  if (error) { print('6. Error al calcular las fechas extremas:', error); return; }
+  print('6. Máximo: ' + e.fechaMax + ' · ' + Math.round(e.haMax) + ' ha');
+  print('6. Mínimo: ' + e.fechaMin + ' · ' + Math.round(e.haMin) + ' ha');
+  mapaFecha(e.fechaMax, '6a. Agua en la fecha de MÁXIMO (' + e.fechaMax + ')', '08306b');
+  mapaFecha(e.fechaMin, '6b. Agua en la fecha de MÍNIMO (' + e.fechaMin + ')', 'ff0000');
+});
 
 // ===== 7. FRECUENCIA DE AGUA EN EL PERIODO ===================================
 // % de observaciones válidas en las que el píxel tenía agua
-var frecuencia = porDia.map(function (img) {
-  return img.normalizedDifference(['B3', 'B11']).gt(UMBRAL_MNDWI);
-}).mean().multiply(100).updateMask(zona);
+// Se calcula escena a escena (no con los mosaicos diarios): es mucho más
+// ligero para el mapa. Los píxeles con nube no cuentan.
+var frecuencia = s2col.linkCollection(CS, ['cs_cdf']).map(function (img) {
+  return img.normalizedDifference(['B3', 'B11']).gt(UMBRAL_MNDWI)
+    .updateMask(img.select('cs_cdf').gte(0.60));
+}).mean().multiply(100).updateMask(zona).clip(aoi);
 Map.addLayer(frecuencia, {min: 0, max: 100, palette: ['ffffcc', '41b6c4', '081d58']},
-  '7. Frecuencia de agua 2019–2025 (%)');
+  '7. Frecuencia de agua ' + INICIO.slice(0, 4) + '–' + FIN.slice(0, 4) + ' (%)');
 
 // ===== 8. EXPORTAR LA SERIE (por si el gráfico tarda demasiado) ===============
 Export.table.toDrive({
